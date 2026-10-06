@@ -1,0 +1,6 @@
+provider_installation {
+  dev_overrides {
+    "ronati/typesense" = "/Users/elliotmaincourt/github.com/omi-lab/terraform-provider-typesense"
+  }
+  direct {}
+}

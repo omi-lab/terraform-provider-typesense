@@ -45,6 +45,7 @@ resource "typesense_collection" "my_collection" {
 
 - `default_sorting_field` (String) Default sorting field
 - `deletion_protection` (Boolean) Whether or not to allow Terraform to destroy the collection. Unless this field is set to false in Terraform state, a terraform destroy or terraform apply that would delete the collection will fail.
+- `embed_api_keys` (Map of String, Sensitive) Remote embedding API keys, keyed by field name. Typesense does not return these credentials. They sit outside `fields` because a sensitive value inside a set marks the entire set sensitive.
 - `enable_nested_fields` (Boolean) Enable nested fields, must be enabled to use object/object[] types
 - `fields` (Block Set) (see [below for nested schema](#nestedblock--fields))
 - `symbols_to_index` (List of String) List of symbols to index
@@ -89,15 +90,15 @@ Optional:
 
 Optional:
 
-- `access_token` (String, Sensitive) Access token for authentication
-- `api_key` (String, Sensitive) API key for authentication
+- `access_token` (String) Do not set. Credentials inside fields mark the whole set sensitive, and Typesense does not return them. Use embed_api_keys.
+- `api_key` (String) Do not set. Use embed_api_keys, keyed by field name.
 - `client_id` (String) Client ID for OAuth
-- `client_secret` (String, Sensitive) Client secret for OAuth
+- `client_secret` (String) Do not set. Credentials inside fields mark the whole set sensitive, and Typesense does not return them. Use embed_api_keys.
 - `indexing_prefix` (String) Prefix added to text during indexing
 - `model_name` (String) Model name for embedding generation (e.g. ts/clip-vit-b-p32)
 - `project_id` (String) Project ID for cloud providers
 - `query_prefix` (String) Prefix added to text during querying
-- `refresh_token` (String, Sensitive) Refresh token for OAuth
+- `refresh_token` (String) Do not set. Credentials inside fields mark the whole set sensitive, and Typesense does not return them. Use embed_api_keys.
 - `url` (String) URL for remote embedding model
 
 ## Import
