@@ -46,6 +46,7 @@ type CollectionResourceModel struct {
 	SymbolsToIndex      []types.String                 `tfsdk:"symbols_to_index"`
 	TokenSeparators     []types.String                 `tfsdk:"token_separators"`
 	DeletionProtection  types.Bool                     `tfsdk:"deletion_protection"`
+	EmbedAPIKeys        types.Map                      `tfsdk:"embed_api_keys"`
 }
 
 type CollectionResourceFieldModel struct {
@@ -161,6 +162,13 @@ func (r *CollectionResource) Schema(ctx context.Context, req resource.SchemaRequ
 				MarkdownDescription: "Whether or not to allow Terraform to destroy the collection. Unless this field is set to false in Terraform state, a terraform destroy or terraform apply that would delete the collection will fail.",
 				Default:             booldefault.StaticBool(false),
 			},
+			"embed_api_keys": schema.MapAttribute{
+				ElementType: types.StringType,
+				Optional:    true,
+				Sensitive:   true,
+				MarkdownDescription: "Remote embedding API keys, keyed by field name. " +
+					"Typesense does not return these credentials. They sit outside `fields` because a sensitive value inside a set marks the entire set sensitive.",
+			},
 		},
 		Blocks: map[string]schema.Block{
 			"fields": schema.SetNestedBlock{
@@ -267,15 +275,13 @@ func (r *CollectionResource) Schema(ctx context.Context, req resource.SchemaRequ
 										},
 										"access_token": schema.StringAttribute{
 											Optional:    true,
-											Computed:    true,
-											Sensitive:   true,
-											Description: "Access token for authentication",
+											Description: "Do not set. Credentials inside fields mark the whole set sensitive, and Typesense does not return them. Use embed_api_keys.",
+											Validators:  []validator.String{forbidNestedEmbedSecret{}},
 										},
 										"api_key": schema.StringAttribute{
 											Optional:    true,
-											Computed:    true,
-											Sensitive:   true,
-											Description: "API key for authentication",
+											Description: "Do not set. Use embed_api_keys, keyed by field name.",
+											Validators:  []validator.String{forbidNestedEmbedSecret{}},
 										},
 										"client_id": schema.StringAttribute{
 											Optional:    true,
@@ -284,9 +290,8 @@ func (r *CollectionResource) Schema(ctx context.Context, req resource.SchemaRequ
 										},
 										"client_secret": schema.StringAttribute{
 											Optional:    true,
-											Computed:    true,
-											Sensitive:   true,
-											Description: "Client secret for OAuth",
+											Description: "Do not set. Credentials inside fields mark the whole set sensitive, and Typesense does not return them. Use embed_api_keys.",
+											Validators:  []validator.String{forbidNestedEmbedSecret{}},
 										},
 										"indexing_prefix": schema.StringAttribute{
 											Optional:    true,
@@ -305,9 +310,8 @@ func (r *CollectionResource) Schema(ctx context.Context, req resource.SchemaRequ
 										},
 										"refresh_token": schema.StringAttribute{
 											Optional:    true,
-											Computed:    true,
-											Sensitive:   true,
-											Description: "Refresh token for OAuth",
+											Description: "Do not set. Credentials inside fields mark the whole set sensitive, and Typesense does not return them. Use embed_api_keys.",
+											Validators:  []validator.String{forbidNestedEmbedSecret{}},
 										},
 									},
 								},
@@ -367,10 +371,12 @@ func (r *CollectionResource) Create(ctx context.Context, req resource.CreateRequ
 	}
 	schema.TokenSeparators = &tokensSeparators
 
+	embedAPIKeys := stringMap(data.EmbedAPIKeys)
+
 	fields := []api.Field{}
 
 	for _, field := range data.Fields {
-		fields = append(fields, filedModelToApiField(field))
+		fields = append(fields, filedModelToApiField(field, embedAPIKeys))
 	}
 
 	schema.Fields = fields
@@ -534,28 +540,36 @@ func (r *CollectionResource) Update(ctx context.Context, req resource.UpdateRequ
 		stateItems[state.Fields[i].Name.ValueString()] = state.Fields[i]
 	}
 
+	embedAPIKeys := stringMap(plan.EmbedAPIKeys)
+	rotatedKeys := rotatedEmbedAPIKeyFields(state.EmbedAPIKeys, plan.EmbedAPIKeys)
+
 	schema := &api.CollectionUpdateSchema{}
 
 	var drop = new(bool)
 	*drop = true
 
 	for _, field := range plan.Fields {
+		fieldName := field.Name.ValueString()
 		// item not exists, need to create
-		if _, ok := stateItems[field.Name.ValueString()]; !ok {
-			schema.Fields = append(schema.Fields, filedModelToApiField(field))
+		if _, ok := stateItems[fieldName]; !ok {
+			schema.Fields = append(schema.Fields, filedModelToApiField(field, embedAPIKeys))
 
-			tflog.Info(ctx, "###Field will be created: "+field.Name.ValueString())
+			tflog.Info(ctx, "###Field will be created: "+fieldName)
 
-		} else if !fieldsEqual(stateItems[field.Name.ValueString()], field) {
-			// item was changed, need to update
+		} else if !fieldsEqual(stateItems[fieldName], field) || rotatedKeys[fieldName] {
+			// item was changed, need to update. Typesense only applies a field
+			// change by dropping it and adding it again, which re-embeds every
+			// document. A missing embed_api_keys value in state is the first
+			// time Terraform records a key the server already has, so that
+			// adoption is not a rotation.
 
 			schema.Fields = append(schema.Fields,
 				api.Field{
 					Drop: drop,
-					Name: field.Name.ValueString(),
+					Name: fieldName,
 				},
-				filedModelToApiField(field))
-			tflog.Info(ctx, "###Field will be updated: "+field.Name.ValueString())
+				filedModelToApiField(field, embedAPIKeys))
+			tflog.Info(ctx, "###Field will be updated: "+fieldName)
 
 		} else {
 			// item was not changed, do nothing
@@ -715,7 +729,7 @@ func (r *CollectionResource) ModifyPlan(ctx context.Context, req resource.Modify
 	}
 }
 
-func filedModelToApiField(field CollectionResourceFieldModel) api.Field {
+func filedModelToApiField(field CollectionResourceFieldModel, embedAPIKeys map[string]string) api.Field {
 	apiField := api.Field{
 		Name:           field.Name.ValueString(),
 		Facet:          field.Facet.ValueBoolPointer(),
@@ -736,6 +750,11 @@ func filedModelToApiField(field CollectionResourceFieldModel) api.Field {
 	}
 
 	apiField.Embed = fieldEmbedModelToAPI(field.Embed)
+	if apiField.Embed != nil && apiField.Embed.ModelConfig.ApiKey == nil {
+		if key, ok := embedAPIKeys[field.Name.ValueString()]; ok && key != "" {
+			apiField.Embed.ModelConfig.ApiKey = &key
+		}
+	}
 
 	return apiField
 }
@@ -789,16 +808,19 @@ func flattenFieldEmbed(embed *fieldEmbedAPI) *CollectionFieldEmbedModel {
 	}
 
 	res.ModelConfig = &CollectionFieldEmbedModelConfigModel{
-		ModelName:      types.StringValue(embed.ModelConfig.ModelName),
-		Url:            types.StringPointerValue(embed.ModelConfig.Url),
-		AccessToken:    types.StringPointerValue(embed.ModelConfig.AccessToken),
-		ApiKey:         types.StringPointerValue(embed.ModelConfig.ApiKey),
-		ClientId:       types.StringPointerValue(embed.ModelConfig.ClientId),
-		ClientSecret:   types.StringPointerValue(embed.ModelConfig.ClientSecret),
+		ModelName: types.StringValue(embed.ModelConfig.ModelName),
+		Url:       types.StringPointerValue(embed.ModelConfig.Url),
+		ClientId:  types.StringPointerValue(embed.ModelConfig.ClientId),
+		// Typesense strips credentials on GET. They must not be stored inside
+		// fields: a sensitive value in that set marks every field sensitive,
+		// and a null read-back plans a drop+add that re-embeds the collection.
+		AccessToken:    types.StringNull(),
+		ApiKey:         types.StringNull(),
+		ClientSecret:   types.StringNull(),
+		RefreshToken:   types.StringNull(),
 		IndexingPrefix: types.StringPointerValue(embed.ModelConfig.IndexingPrefix),
 		ProjectId:      types.StringPointerValue(embed.ModelConfig.ProjectId),
 		QueryPrefix:    types.StringPointerValue(embed.ModelConfig.QueryPrefix),
-		RefreshToken:   types.StringPointerValue(embed.ModelConfig.RefreshToken),
 	}
 
 	return res
@@ -806,4 +828,61 @@ func flattenFieldEmbed(embed *fieldEmbedAPI) *CollectionFieldEmbedModel {
 
 func fieldsEqual(a, b CollectionResourceFieldModel) bool {
 	return reflect.DeepEqual(a, b)
+}
+
+func stringMap(m types.Map) map[string]string {
+	out := map[string]string{}
+	if m.IsNull() || m.IsUnknown() {
+		return out
+	}
+	for name, value := range m.Elements() {
+		s, ok := value.(types.String)
+		if !ok || s.IsNull() || s.IsUnknown() || s.ValueString() == "" {
+			continue
+		}
+		out[name] = s.ValueString()
+	}
+	return out
+}
+
+// rotatedEmbedAPIKeyFields reports fields whose embed API key changed from one
+// stored value to another. A null state map means Terraform is recording a key
+// the collection already uses, which must not drop and re-add the field.
+func rotatedEmbedAPIKeyFields(stateKeys, planKeys types.Map) map[string]bool {
+	rotated := map[string]bool{}
+	if stateKeys.IsNull() || stateKeys.IsUnknown() || planKeys.IsNull() || planKeys.IsUnknown() {
+		return rotated
+	}
+	stateElems := stateKeys.Elements()
+	for name, planVal := range planKeys.Elements() {
+		stateVal, ok := stateElems[name]
+		if !ok || stateVal.IsNull() || stateVal.IsUnknown() {
+			continue
+		}
+		if !stateVal.Equal(planVal) {
+			rotated[name] = true
+		}
+	}
+	return rotated
+}
+
+type forbidNestedEmbedSecret struct{}
+
+func (forbidNestedEmbedSecret) Description(context.Context) string {
+	return "must be unset; set embed_api_keys instead"
+}
+
+func (forbidNestedEmbedSecret) MarkdownDescription(context.Context) string {
+	return "Must be unset. Set embed_api_keys instead."
+}
+
+func (forbidNestedEmbedSecret) ValidateString(_ context.Context, req validator.StringRequest, resp *validator.StringResponse) {
+	if req.ConfigValue.IsNull() || req.ConfigValue.IsUnknown() {
+		return
+	}
+	resp.Diagnostics.AddAttributeError(
+		req.Path,
+		"Embedding credential must be set on embed_api_keys",
+		"Typesense does not return this value. Storing it inside fields marks every field sensitive and plans a new embedding on every run. Set embed_api_keys, keyed by field name.",
+	)
 }
